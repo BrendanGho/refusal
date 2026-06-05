@@ -1,3 +1,7 @@
+[![Generic badge](https://img.shields.io/badge/Project-Page-orange.svg)](https://latentevasion.github.io/)
+[![arXiv](https://img.shields.io/badge/arXiv-2409.01249-b31b1b.svg)](https://arxiv.org/pdf/2605.21706)
+
+
 # Latent-space Attacks for Refusal Evasion in Language Models
 
 Refusal is the functional behavior that enables safety-aligned language models to reject harmful or unethical requests. Recent work in mechanistic interpretability has shown that refusal can be represented through directions or decision boundaries in the model's latent space. This repository explores a complementary perspective: refusal suppression can be formulated as a latent-space evasion problem against linear refusal probes.
