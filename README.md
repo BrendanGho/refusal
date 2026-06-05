@@ -1,5 +1,5 @@
 [![Generic badge](https://img.shields.io/badge/Project-Page-orange.svg)](https://latentevasion.github.io/)
-[![arXiv](https://img.shields.io/badge/arXiv-2409.01249-b31b1b.svg)](https://arxiv.org/pdf/2605.21706)
+[![arXiv](https://img.shields.io/badge/arXiv-2605.21706-b31b1b.svg)](https://arxiv.org/pdf/2605.21706)
 
 
 # Latent-space Attacks for Refusal Evasion in Language Models
