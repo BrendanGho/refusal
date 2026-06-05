@@ -1,0 +1,67 @@
+import torch
+
+from .language_models import LanguageModel
+from utils.models_utils import get_ablated_matrix
+
+
+class Qwen35_9b(LanguageModel):
+    """A class to manage the 'Qwen/Qwen3.5-9B' model."""
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3.5-9B",
+        device="cuda",
+        system_prompt=None,
+        quantization_config=None,
+    ):
+        super().__init__(model_name, system_prompt, device, quantization_config)
+        self.hidden_dimension = self.model.config.hidden_size
+        self.num_layer = len(self._get_transformer_layers())
+        self.refusal_token_id = [40]
+
+    def _get_prompt(self, prompt=""):
+        if getattr(self.tokenizer, "chat_template", None):
+            messages = []
+            if self.system_prompt is not None:
+                messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        raise NotImplementedError("Prompt construction for non-chat-template tokenizers is not implemented.")
+
+    def _get_transformer_layers(self):
+        return self.model.model.layers
+
+    def _get_eoi_toks(self):
+        return [self.tokenizer.eos_token_id]
+
+    def _get_end_of_reasoning_toks(self):
+        return self.tokenizer.encode("</think>\n\n", add_special_tokens=False)
+
+    def ablate_weights(self, direction: torch.Tensor):
+        self.model.model.embed_tokens.weight.data = get_ablated_matrix(
+            self.model.model.embed_tokens.weight.data,
+            direction,
+        )
+
+        for block in self.model.model.layers:
+            layer_type = getattr(block, "layer_type", None)
+            if layer_type == "linear_attention":
+                attn_out_proj = block.linear_attn.out_proj
+            else:
+                attn_out_proj = block.self_attn.o_proj
+
+            attn_out_proj.weight.data = get_ablated_matrix(
+                attn_out_proj.weight.data.T,
+                direction,
+            ).T
+            block.mlp.down_proj.weight.data = get_ablated_matrix(
+                block.mlp.down_proj.weight.data.T,
+                direction,
+            ).T
+
+        print("✓ Weights ablated.")
