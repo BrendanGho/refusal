@@ -9,7 +9,7 @@ class Llama32_3b(LanguageModel):
     
     """A class to manage the 'meta-llama/Llama-3.2-3B-Instruct' model."""
 
-    def __init__(self, model_name: str = "meta-llama/Llama-3.2-3B-Instruct", device='cuda', system_prompt=None, quantization_config=None):
+    def __init__(self, model_name: str = "unsloth/Llama-3.2-3B-Instruct", device='cuda', system_prompt=None, quantization_config=None):
         super().__init__(model_name, system_prompt, device, quantization_config)
         self.template_name = 'llama-3'
         self.hidden_dimension = 3072

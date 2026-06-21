@@ -29,11 +29,11 @@ Output (under --out_dir, e.g. a USB mount):
 """
 
 import argparse
-import json
 from pathlib import Path
+import json, glob, os, torch
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 from tqdm import tqdm
 
 from utils.models_utils import get_model_info
@@ -312,6 +312,21 @@ def main():
 
     print(f"Done. {n_done} conversations processed this run, {n_turns_total} turns. "
           f"Index has {len(index)} conversations total at {index_path}.")
+
+
+    # root = os.path.join(os.environ["USB"], "crescendo_acts_smoke")
+    # e = [json.loads(l) for l in open(f"{root}/index.jsonl") if l.strip()][0]
+    # print("turns:", e["turns"], "jailbroken:", e.get("jailbroken"))
+
+    # t = load_file(glob.glob(f"{root}/acts/*.safetensors")[0])
+    # for k, v in t.items():
+    #     print(f"{k:18s} {tuple(v.shape)} {v.dtype}")
+
+    # # attention rows must sum to ~1 over key positions (softmax probs)
+    # for k in sorted(t):
+    #     if k.startswith("attn_pattern_t"):
+    #         s = t[k].float().sum(-1)        # (L, n_heads)
+    #         print(f"{k}: row-sum min {s.min():.4f} max {s.max():.4f}")
 
 
 if __name__ == "__main__":

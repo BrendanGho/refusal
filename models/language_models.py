@@ -45,7 +45,7 @@ class LanguageModel(ABC):
                 token=token,
                 quantization_config=bnb_config,
                 device_map=self.device,
-                torch_dtype=torch.float16 if bnb_config is None else None,
+                dtype=torch.float16 if bnb_config is None else None,
                 trust_remote_code=True
             )
             self.model.eval()
@@ -286,10 +286,13 @@ class LanguageModel(ABC):
         the decomposition resid_mid[l] = resid_post[l-1] + attn_out[l] is complete for every
         layer (use embed as resid_post[-1]).
 
-        NOTE: output_attentions=True forces eager attention, which materializes the full
-        [n_heads, seq, seq] matrix per layer transiently. Fine for ~3B at ~1k tokens; for
-        much larger models / longer contexts this can OOM — capture patterns in a chunked
-        or per-layer-streamed follow-up there.
+        NOTE: requires eager attention (call enable_eager_attention first). We do NOT pass
+        output_attentions=True -- in transformers 5.x that routes collection through an
+        output-capturing wrapper holding all layers' [n_heads, seq, seq] matrices at once
+        (OOM). Eager returns per-layer weights in the self_attn output tuple anyway; a forward
+        hook captures each layer's last-token row and NULLs the full matrix so it frees
+        immediately -- peak is one layer's matrix at a time. For much larger models / very long
+        contexts even one layer's matrix can be large; chunked pattern capture is the next step.
         """
         if system_prompt is not None:
             messages = [{"role": "system", "content": system_prompt}] + list(messages)
@@ -302,7 +305,10 @@ class LanguageModel(ABC):
         n_heads, head_dim = self._head_dims()
 
         z_store: dict[int, torch.Tensor] = {}
+        attn_store: dict[int, torch.Tensor] = {}
         handles = []
+
+        # head_z: pre-W_O per-head values, captured from each o_proj input.
         projections = self._attn_output_projections()
         for li, proj in enumerate(projections):
             def make_pre_hook(idx):
@@ -312,12 +318,43 @@ class LanguageModel(ABC):
                 return pre_hook
             handles.append(proj.register_forward_pre_hook(make_pre_hook(li)))
 
+        # attn_row: last-token attention pattern. Capture just that row from each layer and
+        # NULL the full (n_heads, seq, seq) matrix in the returned output so it is freed
+        # immediately -- otherwise output_attentions accumulates all layers' matrices at once
+        # (~15 GB at seq~2400 for 28 layers) and OOMs. Peak is one layer's matrix at a time.
+        layers = self._get_transformer_layers()
+        for li, layer in enumerate(layers):
+            attn_mod = (
+                getattr(layer, "self_attn", None)
+                or getattr(layer, "attn", None)
+                or getattr(layer, "attention", None)
+            )
+            if attn_mod is None:
+                raise AttributeError(f"Could not find attention module on layer {li}")
+
+            def make_attn_hook(idx):
+                def hook(module, inp, output):
+                    # eager attention returns (attn_output, attn_weights[, ...]);
+                    # attn_weights: (batch, n_heads, seq_q, seq_k)
+                    attn_weights = output[1] if isinstance(output, tuple) and len(output) > 1 else None
+                    if attn_weights is not None:
+                        attn_store[idx] = attn_weights[0, :, -1, :].detach().to("cpu", torch.float32)
+                        return (output[0], None) + tuple(output[2:])
+                    return output
+                return hook
+            handles.append(attn_mod.register_forward_hook(make_attn_hook(li)))
+
         try:
             with torch.no_grad():
                 outputs = self.model(
                     input_ids=inputs.input_ids,
                     output_hidden_states=True,
-                    output_attentions=True,
+                    # output_attentions=True is intentionally NOT set: in transformers 5.x it
+                    # routes attention collection through an output-capturing wrapper that
+                    # holds all layers' full [n_heads, seq, seq] matrices at once (OOM).
+                    # Eager attention (forced via enable_eager_attention) computes per-layer
+                    # weights and returns them in the self_attn output tuple regardless, so the
+                    # forward hook below grabs each layer's row and frees its matrix immediately.
                 )
         finally:
             for h in handles:
@@ -325,17 +362,19 @@ class LanguageModel(ABC):
 
         if not getattr(outputs, "hidden_states", None):
             raise RuntimeError("Model did not return hidden_states.")
-        if not getattr(outputs, "attentions", None):
-            raise RuntimeError(
-                "Model did not return attentions. Load/configure the model with eager "
-                "attention (config._attn_implementation = 'eager') to capture patterns."
-            )
 
         embed = outputs.hidden_states[0][0, -1, :].float().cpu()  # (D,) residual entering layer 0
         hidden_states = outputs.hidden_states[1:]  # skip embedding layer
         resid = torch.stack([h[0, -1, :].float().cpu() for h in hidden_states])  # (L, D)
 
         n_layers = len(hidden_states)
+        if len(attn_store) != n_layers:
+            raise RuntimeError(
+                f"Captured {len(attn_store)} attention rows but expected {n_layers}. The model "
+                "did not return per-layer attention weights -- ensure eager attention is enabled "
+                "(call enable_eager_attention() before capture)."
+            )
+
         expected = n_heads * head_dim
         head_z_rows = []
         for i in range(n_layers):
@@ -349,9 +388,7 @@ class LanguageModel(ABC):
             head_z_rows.append(flat.view(n_heads, head_dim))
         head_z = torch.stack(head_z_rows)  # (L, n_heads, head_dim)
 
-        attn_row = torch.stack(
-            [a[0, :, -1, :].float().cpu() for a in outputs.attentions]
-        )  # (L, n_heads, seq_k)
+        attn_row = torch.stack([attn_store[i] for i in range(n_layers)])  # (L, n_heads, seq_k)
 
         return {
             "resid": resid,
