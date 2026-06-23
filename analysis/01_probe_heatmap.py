@@ -53,6 +53,8 @@ def get_args():
     p.add_argument("--samples_out", type=str, default=None,
                    help="Output JSON for qualitative samples. Default: <refusal_dir>/qualitative_samples.json")
     p.add_argument("--seed", type=int, default=0, help="RNG seed for reproducible sampling.")
+    p.add_argument("--goals_out", type=str, default=None,
+                   help="Output JSON of per-goal ASR / jailbroken turns. Default: <refusal_dir>/goal_report.json")
     return p.parse_args()
 
 
@@ -194,6 +196,64 @@ def write_samples(out_path: Path, activations_dir: Path, index: dict[str, dict],
     print(f"Saved samples -> {out_path}")
 
 
+def write_goal_report(out_path: Path, conv_ids: list[str], index: dict[str, dict]) -> None:
+    """Per-goal (objective) jailbreak summary over the scored conversations.
+
+    For each objective: ASR (share of its conversations jailbroken on any turn), which
+    turn numbers a jailbreak occurred on (+ counts), recover/no-recover breakdown, and
+    per-conversation labels. Sorted by descending ASR so the weakest goals surface first.
+    """
+    goals: dict[str, dict] = {}
+    for cid in conv_ids:
+        entry = index.get(cid)
+        if entry is None:
+            continue
+        obj = entry.get("objective") or "<unknown>"
+        g = goals.setdefault(obj, {
+            "objective_index": entry.get("objective_index"),
+            "n_conversations": 0, "n_labeled": 0, "n_jailbroken": 0,
+            "jailbroken_turn_counts": {}, "first_jailbroken_turn_counts": {},
+            "outcomes": {"recover": 0, "no_recover": 0, "never": 0, "unlabeled": 0},
+            "conversations": [],
+        })
+        turns = entry.get("turns") or []
+        jb = entry.get("jailbroken") or []
+        labeled = bool(jb) and any(v is not None for v in jb)
+        jb_turns = [int(turns[i]) for i in range(len(turns))
+                    if i < len(jb) and jb[i]]
+
+        g["n_conversations"] += 1
+        g["n_labeled"] += int(labeled)
+        g["n_jailbroken"] += int(bool(jb_turns))
+        for t in jb_turns:
+            g["jailbroken_turn_counts"][t] = g["jailbroken_turn_counts"].get(t, 0) + 1
+        fjt = first_jailbroken_turn(entry)
+        key = "never" if fjt is None else str(fjt)
+        if labeled:
+            g["first_jailbroken_turn_counts"][key] = g["first_jailbroken_turn_counts"].get(key, 0) + 1
+        g["outcomes"][jailbreak_trajectory(entry)] += 1
+        g["conversations"].append({
+            "conversation_id": cid,
+            "sample_index": entry.get("sample_index"),
+            "turns": turns,
+            "jailbroken": jb,
+        })
+
+    for g in goals.values():
+        g["asr"] = round(g["n_jailbroken"] / g["n_labeled"], 4) if g["n_labeled"] else None
+        g["jailbroken_turns"] = sorted(int(t) for t in g["jailbroken_turn_counts"])
+        g["jailbroken_turn_counts"] = {str(k): v for k, v in sorted(g["jailbroken_turn_counts"].items())}
+
+    ordered = dict(sorted(
+        goals.items(),
+        key=lambda kv: (-(kv[1]["asr"] if kv[1]["asr"] is not None else -1.0),
+                        kv[1].get("objective_index") if kv[1].get("objective_index") is not None else 1e9),
+    ))
+    out_path.write_text(json.dumps(ordered, indent=2, ensure_ascii=False))
+    n_any = sum(1 for g in goals.values() if g["n_jailbroken"] > 0)
+    print(f"Goal report: {len(goals)} goals, {n_any} with >=1 jailbreak -> {out_path}")
+
+
 def first_turn_panels(conv_ids: list[str], index: dict[str, dict]) -> list[tuple[str, list[str]]]:
     """Group conversation ids by first-jailbroken turn: t1..tK, then never, then unlabeled."""
     groups: dict[str, list[str]] = {}
@@ -208,17 +268,25 @@ def first_turn_panels(conv_ids: list[str], index: dict[str, dict]) -> list[tuple
     return [(k, groups[k]) for k in sorted(groups, key=sort_key)]
 
 
-def render_heatmap(panels: list[tuple[str, list[str]]], matrices: dict[str, np.ndarray],
-                   suptitle: str, out_path: Path, cmap: str, dpi: int) -> list[tuple[str, int]]:
-    """Render side-by-side mean (layer x turn) heatmaps, one per panel. Empty panels dropped."""
-    panels = [(title, ids) for title, ids in panels if ids]
-    if not panels:
-        print(f"Skipped {out_path.name}: no conversations in any panel.")
-        return []
-    means = [(title, len(ids), mean_over_conversations([matrices[c] for c in ids]))
-             for title, ids in panels]
+def panel_means(panels: list[tuple[str, list[str]]],
+                matrices: dict[str, np.ndarray]) -> list[tuple[str, int, np.ndarray]]:
+    """(title, n, mean matrix) per non-empty panel."""
+    return [(title, len(ids), mean_over_conversations([matrices[c] for c in ids]))
+            for title, ids in panels if ids]
 
-    vmax = max((float(np.abs(m).max()) for _, _, m in means), default=1.0) or 1.0
+
+def render_heatmap(means: list[tuple[str, int, np.ndarray]], suptitle: str, out_path: Path,
+                   cmap: str, dpi: int, vmax: float | None = None) -> None:
+    """Render side-by-side mean (layer x turn) heatmaps from precomputed panel means.
+
+    Pass vmax to share one color scale across figures so they are directly comparable;
+    otherwise it is derived from this figure's own panels.
+    """
+    if not means:
+        print(f"Skipped {out_path.name}: no conversations in any panel.")
+        return
+    if vmax is None:
+        vmax = max((float(np.abs(m).max()) for _, _, m in means), default=1.0) or 1.0
     n_panels = len(means)
     n_layers = means[0][2].shape[0]
 
@@ -238,12 +306,10 @@ def render_heatmap(panels: list[tuple[str, list[str]]], matrices: dict[str, np.n
 
     fig.suptitle(suptitle)
     cbar = fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025)
-    cbar.set_label("phi  (+refusal / -compliance)")
+    cbar.set_label("phi  (-compliance / +refusal)")
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
-    summary = [(title, n) for title, n, _ in means]
-    print(f"Saved {out_path.name}: " + ", ".join(f"{t}={n}" for t, n in summary))
-    return summary
+    print(f"Saved {out_path.name}: " + ", ".join(f"{t}={n}" for t, n, _ in means))
 
 
 def main():
@@ -269,12 +335,17 @@ def main():
         ]
         out_dir = Path(args.out) if args.out else refusal_dir
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Compute every panel mean first, then share one color scale so the 3 PNGs compare.
+        per_cat = [(slug, label, ids, panel_means(first_turn_panels(ids, index), matrices))
+                   for slug, label, ids in categories]
+        vmax = max((float(np.abs(m).max()) for _, _, _, means in per_cat
+                    for _, _, m in means), default=1.0) or 1.0
         sample_panels: list[tuple[str, list[str]]] = []
-        for slug, label, ids in categories:
+        for slug, label, ids, means in per_cat:
             render_heatmap(
-                first_turn_panels(ids, index), matrices,
+                means,
                 f"{label}: mean refusal phi (layer x turn) by first-jailbroken turn  (n={len(ids)})",
-                out_dir / f"heatmap_{slug}.png", args.cmap, args.dpi,
+                out_dir / f"heatmap_{slug}.png", args.cmap, args.dpi, vmax=vmax,
             )
             sample_panels.append((label, ids))
     else:
@@ -282,11 +353,14 @@ def main():
         out_path = Path(args.out) if args.out else refusal_dir / "heatmap_by_outcome.png"
         panels = first_turn_panels(list(matrices.keys()), index)
         render_heatmap(
-            panels, matrices,
+            panel_means(panels, matrices),
             "Mean refusal phi (layer x turn), grouped by first-jailbroken turn",
             out_path, args.cmap, args.dpi,
         )
         sample_panels = panels
+
+    goals_out = Path(args.goals_out) if args.goals_out else refusal_dir / "goal_report.json"
+    write_goal_report(goals_out, list(matrices.keys()), index)
 
     if args.samples_per_group > 0:
         samples_out = Path(args.samples_out) if args.samples_out else refusal_dir / "qualitative_samples.json"

@@ -33,6 +33,7 @@ from datasets import Dataset, Features, Value
 from dotenv import load_dotenv
 from huggingface_hub import DatasetCard
 from openai import AsyncOpenAI
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -268,7 +269,8 @@ async def generate_dataset(args) -> None:
 
     sem = asyncio.Semaphore(args.concurrency)
     write_lock = asyncio.Lock()
-    counter = {"done": 0, "ok": 0, "err": 0}
+    counter = {"ok": 0, "err": 0}
+    pbar = tqdm(total=len(pending), desc="conversations", unit="conv")
 
     async def _run(conv_id: str, oi: int, si: int, obj: str) -> None:
         async with sem:
@@ -291,21 +293,20 @@ async def generate_dataset(args) -> None:
                     max_api_retries=args.max_api_retries,
                 )
                 counter["ok"] += 1
-                status = "ok"
             except Exception as e:  # noqa: BLE001
                 rec = {"id": conv_id, "objective": obj, "objective_index": oi,
                        "sample_index": si, "error": repr(e)}
                 counter["err"] += 1
-                status = "ERR"
+                pbar.write(f"ERR {conv_id}: {e!r}")
 
             async with write_lock:
                 with output_path.open("a") as f:
                     f.write(json.dumps(rec) + "\n")
-                counter["done"] += 1
-                print(f"  [{counter['done']}/{len(pending)}] {status} {conv_id}",
-                      file=sys.stderr)
+            pbar.update(1)
+            pbar.set_postfix(ok=counter["ok"], err=counter["err"])
 
     await asyncio.gather(*(_run(*job) for job in pending))
+    pbar.close()
     print(f"\ndone: ok={counter['ok']} err={counter['err']} -> {output_path}",
           file=sys.stderr)
 
@@ -512,7 +513,8 @@ async def label_dataset(args) -> None:
 
     sem = asyncio.Semaphore(args.concurrency)
     write_lock = asyncio.Lock()
-    counter = {"done": 0, "jb": 0, "err": 0}
+    counter = {"ok": 0, "jb": 0, "err": 0}
+    pbar = tqdm(total=len(pending), desc="judging", unit="turn")
 
     async def _run(row: dict) -> None:
         async with sem:
@@ -523,22 +525,24 @@ async def label_dataset(args) -> None:
                     max_retries=args.max_api_retries,
                 )
                 out = {**row, "jailbroken": jailbroken, "judge_model": args.judge_model}
+                counter["ok"] += 1
                 counter["jb"] += int(jailbroken)
             except Exception as e:  # noqa: BLE001
                 out = {**row, "jailbroken": None, "judge_model": args.judge_model,
                        "judge_error": repr(e)}
                 counter["err"] += 1
+                pbar.write(f"ERR {row.get('row_id')}: {e!r}")
             async with write_lock:
                 with output_path.open("a") as f:
                     f.write(json.dumps(out) + "\n")
-                counter["done"] += 1
-                if counter["done"] % 25 == 0 or counter["done"] == len(pending):
-                    print(f"  [{counter['done']}/{len(pending)}] "
-                          f"jb={counter['jb']} err={counter['err']}", file=sys.stderr)
+            pbar.update(1)
+            pbar.set_postfix(jb=counter["jb"], err=counter["err"])
 
     await asyncio.gather(*(_run(r) for r in pending))
-    print(f"\ndone: labeled={counter['done']} jailbroken={counter['jb']} "
-          f"err={counter['err']} -> {output_path}", file=sys.stderr)
+    pbar.close()
+    print(f"\ndone: labeled={counter['ok']} jailbroken={counter['jb']} "
+          f"err={counter['err']} (resumed={len(done)}, total={len(done) + counter['ok'] + counter['err']}) "
+          f"-> {output_path}", file=sys.stderr)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -808,9 +812,10 @@ def _add_generate_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--test-seed", type=int, default=0,
                    help="RNG seed for --test objective selection (default: 0).")
     # sampling
-    p.add_argument("--attacker-temperature", type=float, default=0.9)
+    p.add_argument("--attacker-temperature", type=float, default=0.9,
+                   help="Sampling temperature for the attacker model (default: 0.9).")
     p.add_argument("--target-temperature", type=float, default=1.0,
-                   help="High temperature per the dataset design (default: 1.0).")
+                   help="Sampling temperature for the target model; high per the dataset design (default: 1.0).")
     p.add_argument("--attacker-max-tokens", type=int, default=400)
     p.add_argument("--target-max-tokens", type=int, default=800)
     # runtime
