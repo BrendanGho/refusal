@@ -5,6 +5,7 @@ import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 class LanguageModel(ABC):
     def __init__(self, model_name: str, system_prompt=None, device='cuda', quantization_config=None):
@@ -286,13 +287,13 @@ class LanguageModel(ABC):
         the decomposition resid_mid[l] = resid_post[l-1] + attn_out[l] is complete for every
         layer (use embed as resid_post[-1]).
 
-        NOTE: requires eager attention (call enable_eager_attention first). We do NOT pass
-        output_attentions=True -- in transformers 5.x that routes collection through an
-        output-capturing wrapper holding all layers' [n_heads, seq, seq] matrices at once
-        (OOM). Eager returns per-layer weights in the self_attn output tuple anyway; a forward
-        hook captures each layer's last-token row and NULLs the full matrix so it frees
-        immediately -- peak is one layer's matrix at a time. For much larger models / very long
-        contexts even one layer's matrix can be large; chunked pattern capture is the next step.
+        NOTE: the forward runs through SDPA, not eager / output_attentions. Eager (and the
+        transformers 5.x output-capturing wrapper) materializes the full [n_heads, seq, seq]
+        attention matrix per layer, which OOMs at long multi-turn contexts (~2 GB fp32 softmax
+        per layer at seq~4700). SDPA computes the attention OUTPUT in O(seq) memory without
+        building that matrix; we wrap the registered sdpa fn to additionally compute only the
+        last query's attention row (O(seq)). Net peak attention memory is O(seq), not O(seq^2),
+        so enable_eager_attention is no longer required before capture.
         """
         if system_prompt is not None:
             messages = [{"role": "system", "content": system_prompt}] + list(messages)
@@ -318,45 +319,46 @@ class LanguageModel(ABC):
                 return pre_hook
             handles.append(proj.register_forward_pre_hook(make_pre_hook(li)))
 
-        # attn_row: last-token attention pattern. Capture just that row from each layer and
-        # NULL the full (n_heads, seq, seq) matrix in the returned output so it is freed
-        # immediately -- otherwise output_attentions accumulates all layers' matrices at once
-        # (~15 GB at seq~2400 for 28 layers) and OOMs. Peak is one layer's matrix at a time.
-        layers = self._get_transformer_layers()
-        for li, layer in enumerate(layers):
-            attn_mod = (
-                getattr(layer, "self_attn", None)
-                or getattr(layer, "attn", None)
-                or getattr(layer, "attention", None)
+        # attn_row: last-token attention pattern. Materializing the full (n_heads, seq, seq)
+        # matrix per layer -- which eager attention / output_attentions does -- OOMs at long
+        # multi-turn contexts (one layer's fp32 softmax is ~2 GB at seq~4700). Instead run the
+        # forward through SDPA, which computes the attention OUTPUT in O(seq) memory without ever
+        # building the full matrix, and wrap the registered sdpa fn to ALSO compute just the last
+        # query's attention row (O(seq)). Net peak attention memory is O(seq), not O(seq^2).
+        def _repeat_kv(h, n_rep):
+            b, n_kv, s, d = h.shape
+            if n_rep == 1:
+                return h
+            return h[:, :, None, :, :].expand(b, n_kv, n_rep, s, d).reshape(b, n_kv * n_rep, s, d)
+
+        real_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+
+        def sdpa_capture(module, query, key, value, attention_mask, scaling=None, **kwargs):
+            attn_output, _ = real_sdpa(module, query, key, value, attention_mask, scaling=scaling, **kwargs)
+            k_rep = _repeat_kv(key, getattr(module, "num_key_value_groups", 1))  # (1, n_heads, seq_k, hd)
+            scores = torch.matmul(query[:, :, -1:, :], k_rep.transpose(2, 3))     # (1, n_heads, 1, seq_k)
+            if scaling is not None:
+                scores = scores * scaling
+            if attention_mask is not None:  # None => pure causal; last query sees all keys
+                scores = scores + attention_mask[:, :, -1:, : scores.shape[-1]]
+            attn_store[int(module.layer_idx)] = (
+                torch.softmax(scores, dim=-1, dtype=torch.float32)[0, :, 0, :].to("cpu", torch.float32)
             )
-            if attn_mod is None:
-                raise AttributeError(f"Could not find attention module on layer {li}")
+            return attn_output, None
 
-            def make_attn_hook(idx):
-                def hook(module, inp, output):
-                    # eager attention returns (attn_output, attn_weights[, ...]);
-                    # attn_weights: (batch, n_heads, seq_q, seq_k)
-                    attn_weights = output[1] if isinstance(output, tuple) and len(output) > 1 else None
-                    if attn_weights is not None:
-                        attn_store[idx] = attn_weights[0, :, -1, :].detach().to("cpu", torch.float32)
-                        return (output[0], None) + tuple(output[2:])
-                    return output
-                return hook
-            handles.append(attn_mod.register_forward_hook(make_attn_hook(li)))
-
+        prev_impl = self.model.config._attn_implementation
+        self.model.config._attn_implementation = "sdpa"
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_capture
         try:
             with torch.no_grad():
                 outputs = self.model(
                     input_ids=inputs.input_ids,
                     output_hidden_states=True,
-                    # output_attentions=True is intentionally NOT set: in transformers 5.x it
-                    # routes attention collection through an output-capturing wrapper that
-                    # holds all layers' full [n_heads, seq, seq] matrices at once (OOM).
-                    # Eager attention (forced via enable_eager_attention) computes per-layer
-                    # weights and returns them in the self_attn output tuple regardless, so the
-                    # forward hook below grabs each layer's row and frees its matrix immediately.
+                    use_cache=False,  # single forward; KV cache is dead weight here
                 )
         finally:
+            del ALL_ATTENTION_FUNCTIONS["sdpa"]  # drop local override, restore global sdpa
+            self.model.config._attn_implementation = prev_impl
             for h in handles:
                 h.remove()
 
@@ -370,9 +372,9 @@ class LanguageModel(ABC):
         n_layers = len(hidden_states)
         if len(attn_store) != n_layers:
             raise RuntimeError(
-                f"Captured {len(attn_store)} attention rows but expected {n_layers}. The model "
-                "did not return per-layer attention weights -- ensure eager attention is enabled "
-                "(call enable_eager_attention() before capture)."
+                f"Captured {len(attn_store)} attention rows but expected {n_layers}. The sdpa "
+                "attention wrapper did not run for every layer -- check that the model dispatches "
+                "attention through ALL_ATTENTION_FUNCTIONS['sdpa']."
             )
 
         expected = n_heads * head_dim

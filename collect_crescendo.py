@@ -199,8 +199,6 @@ def main():
     # were trained on. (The model weights are already loaded above; this guards the long
     # per-turn capture loop, not the one-time load.)
     model.assert_token_alignment()
-    # Patterns require eager attention to be materialized by output_attentions=True.
-    model.enable_eager_attention()
 
     out_dir = Path(args.out_dir)
     acts_dir = out_dir / "acts"
